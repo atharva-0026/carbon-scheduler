@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://localhost:6379/1"
 
     electricitymaps_api_key: str | None = None
+    electricitymaps_base_url: str = "https://api.electricitymap.org/v3"
+    carbon_cache_ttl_seconds: int = 900  # 15 minutes
+
     watttime_username: str | None = None
     watttime_password: str | None = None
 
