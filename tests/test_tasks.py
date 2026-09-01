@@ -58,6 +58,7 @@ def test_schedule_job_dispatches_immediately_when_delay_is_zero(monkeypatch, tes
     )
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     monkeypatch.setattr(tasks_module, "choose_schedule", lambda **kwargs: (fake_best, now))
+    monkeypatch.setattr(tasks_module, "fetch_baseline_intensity", lambda: 420.0)
 
     calls = {}
     monkeypatch.setattr(tasks_module.execute_job, "delay", lambda jid: calls.setdefault("delay", jid))
@@ -77,6 +78,8 @@ def test_schedule_job_dispatches_immediately_when_delay_is_zero(monkeypatch, tes
     assert job.scheduled_region == "eu-north-1"
     # SQLite has no tz-aware DATETIME type, so it round-trips as naive UTC.
     assert job.scheduled_start == now.replace(tzinfo=None)
+    assert job.carbon_intensity_actual == 50.0
+    assert job.carbon_intensity_baseline == 420.0
 
 
 def test_schedule_job_schedules_countdown_when_delayed(monkeypatch, test_db):
@@ -94,6 +97,7 @@ def test_schedule_job_schedules_countdown_when_delayed(monkeypatch, test_db):
     )
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     monkeypatch.setattr(tasks_module, "choose_schedule", lambda **kwargs: (fake_best, now))
+    monkeypatch.setattr(tasks_module, "fetch_baseline_intensity", lambda: None)
 
     calls = {}
     monkeypatch.setattr(tasks_module.execute_job, "delay", lambda jid: calls.setdefault("delay", jid))
@@ -112,6 +116,9 @@ def test_schedule_job_schedules_countdown_when_delayed(monkeypatch, test_db):
     job = _get_job(test_db, job_id)
     assert job.status == "scheduled"
     assert job.scheduled_region == "us-west-2"
+    assert job.carbon_intensity_actual == 80.0
+    # A failed baseline lookup shouldn't block scheduling; it's just left unset.
+    assert job.carbon_intensity_baseline is None
 
 
 def test_schedule_job_marks_failed_when_no_regions_available(monkeypatch, test_db):

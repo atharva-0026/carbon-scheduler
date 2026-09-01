@@ -10,6 +10,7 @@ from app.services.job_scheduler import (
     build_candidates,
     candidate_delays,
     choose_schedule,
+    fetch_baseline_intensity,
 )
 
 
@@ -104,3 +105,18 @@ def test_choose_schedule_raises_when_all_regions_fail(monkeypatch):
 
     with pytest.raises(NoAvailableRegionsError):
         choose_schedule()
+
+
+def test_fetch_baseline_intensity_returns_home_region_reading(monkeypatch):
+    fake_client = FakeCarbonClient(mapping={"US-MIDA-PJM": 410.0})  # us-east-1 is HOME_REGION
+    monkeypatch.setattr("app.services.job_scheduler.CarbonIntensityClient", lambda: fake_client)
+
+    assert fetch_baseline_intensity() == 410.0
+    assert fake_client.closed is True
+
+
+def test_fetch_baseline_intensity_returns_none_on_failure(monkeypatch):
+    fake_client = FakeCarbonClient(fail_zones={"US-MIDA-PJM"})
+    monkeypatch.setattr("app.services.job_scheduler.CarbonIntensityClient", lambda: fake_client)
+
+    assert fetch_baseline_intensity() is None

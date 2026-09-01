@@ -18,7 +18,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from app.core.regions import available_regions, latency_ms_from_home, zone_for_region
+from app.core.regions import HOME_REGION, available_regions, latency_ms_from_home, zone_for_region
 from app.services.carbon_intensity import CarbonIntensityClient, CarbonIntensityError
 from app.services.scoring import ScheduleCandidate, ScoredCandidate, ScoringWeights, pick_best_candidate
 
@@ -143,3 +143,32 @@ def choose_schedule(
     )
     assert best is not None  # candidates is non-empty here
     return best, now
+
+
+async def _fetch_home_intensity(client: CarbonIntensityClient) -> float | None:
+    try:
+        zone = zone_for_region(HOME_REGION)
+        data = await client.get_intensity(zone)
+        return data["carbon_intensity"]
+    except (CarbonIntensityError, ValueError) as exc:
+        logger.warning("Could not fetch baseline (home region) carbon intensity: %s", exc)
+        return None
+
+
+def fetch_baseline_intensity() -> float | None:
+    """Carbon intensity of HOME_REGION right now.
+
+    This is the "naive: always run immediately in the home region, ignore
+    carbon" baseline used for carbon-saved reporting. Returns None (rather
+    than raising) if the lookup fails, since a missing baseline shouldn't
+    block scheduling the job itself.
+    """
+
+    async def _run() -> float | None:
+        client = CarbonIntensityClient()
+        try:
+            return await _fetch_home_intensity(client)
+        finally:
+            await client.close()
+
+    return asyncio.run(_run())

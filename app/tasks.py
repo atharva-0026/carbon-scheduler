@@ -10,7 +10,7 @@ from app.celery_app import celery_app
 from app.core.db import SessionLocal
 from app.models.job import Job
 from app.services.execution_adapter import dispatch_job
-from app.services.job_scheduler import NoAvailableRegionsError, choose_schedule
+from app.services.job_scheduler import NoAvailableRegionsError, choose_schedule, fetch_baseline_intensity
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,8 @@ def schedule_job(self, job_id: int) -> dict:
         job.status = "scheduled"
         job.scheduled_region = best.candidate.region
         job.scheduled_start = scheduled_start
+        job.carbon_intensity_actual = best.candidate.carbon_intensity
+        job.carbon_intensity_baseline = fetch_baseline_intensity()
         db.commit()
 
         delay_seconds = max(0, int(best.candidate.delay_minutes * 60))

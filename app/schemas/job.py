@@ -19,6 +19,8 @@ class JobOut(BaseModel):
     deadline: datetime | None = None
     scheduled_region: str | None = None
     scheduled_start: datetime | None = None
+    carbon_intensity_actual: float | None = None
+    carbon_intensity_baseline: float | None = None
     created_at: datetime
 
     class Config:
