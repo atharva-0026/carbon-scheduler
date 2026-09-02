@@ -87,9 +87,10 @@ real Postgres rows too).
 
 ## Stack
 
-FastAPI · Celery · Redis (broker + result backend + carbon-intensity cache)
-· Postgres · SQLAlchemy · Streamlit + Plotly · Docker Compose · deployed on
-Railway.
+FastAPI · Celery · Redis (broker + result backend + carbon-intensity cache;
+[Upstash](https://upstash.com/) in production) · Postgres (Neon or Render
+Postgres in production) · SQLAlchemy · Streamlit + Plotly · Docker Compose ·
+deployed on [Render](https://render.com/) (`render.yaml`).
 
 ## Layout
 
@@ -185,6 +186,57 @@ pytest
 
 All 60+ tests run against an in-memory SQLite DB and mocked HTTP/Celery
 calls — no Postgres, Redis, or ElectricityMaps key required.
+
+## Deploying to Render
+
+`render.yaml` (a [Render Blueprint](https://render.com/docs/blueprint-spec))
+defines the two long-running processes:
+
+- `carbon-scheduler-api` — a web service running the FastAPI app
+- `carbon-scheduler-worker` — a background worker running the Celery worker
+
+Both share the same env vars and need external, managed Postgres and Redis
+(Render's free tier doesn't include a persistent Redis instance, so this
+project uses [Upstash Redis](https://upstash.com/) instead — see below).
+
+1. Push this repo to GitHub, then in the Render dashboard: **New +** ->
+   **Blueprint**, point it at the repo. It reads `render.yaml` and creates
+   both services.
+2. Set `DATABASE_URL` on each service (Render only lets you fill in
+   `sync: false` vars per-service, not once): a
+   [Neon](https://neon.tech/) or [Render Postgres](https://render.com/docs/postgresql)
+   connection string. Either works — this project only needs a plain
+   `DATABASE_URL`, not a Render-managed database resource, so Neon's free
+   tier is a fine default.
+3. Set `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` on
+   each service to the **same** Upstash Redis `rediss://` connection
+   string (see the Upstash block in `.env.example`, and the Redis section
+   below for why one URL covers all three).
+4. Set `ELECTRICITYMAPS_API_KEY` on each service if you want live
+   scheduling to work in production (see Limitations).
+
+Tables are created automatically on first boot either process does (same
+`init_db()` as Docker Compose), so there's no separate migration step.
+
+The Streamlit dashboard isn't part of `render.yaml` — it's meant to be run
+locally against a copy of production data, or added as its own Render web
+service (`streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0`)
+the same way as the API, if you want it hosted too.
+
+## Redis: Upstash in production, plain Redis locally
+
+`REDIS_URL` (the ElectricityMaps cache), `CELERY_BROKER_URL`, and
+`CELERY_RESULT_BACKEND` are three separate settings but don't have to point
+at three separate databases. Locally / in Docker Compose they're the same
+container on different logical DBs (`/0`, `/1`); in production they're
+[Upstash Redis](https://upstash.com/), which only offers DB 0, so all three
+point at the identical `rediss://` URL — safe, because the three use
+non-overlapping key prefixes (`carbon_intensity:*`, Celery's queue keys,
+and `celery-task-meta-*`). `app/celery_app.py` detects the `rediss://`
+scheme and sets the `ssl_cert_reqs` option Celery/Kombu requires for it
+(without this, Celery refuses to start against a TLS Redis URL); the
+carbon-intensity client's `redis.asyncio.from_url()` already defaults to
+TLS-verified for `rediss://` and needed no change.
 
 ## Limitations
 

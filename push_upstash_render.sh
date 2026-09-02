@@ -3,6 +3,42 @@ set -euo pipefail
 
 # Run this from inside your carbon-scheduler repo root.
 
+# Clean up the delivery script from last time -- it got swept into the repo
+# by 'git add -A' when it was sitting in this folder. Harmless, just noise.
+rm -f push_docker_fix.sh
+
+mkdir -p "$(dirname ".env.example")"
+cat > .env.example << 'PYEOF__ENV_EXAMPLE'
+APP_ENV=development
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/carbon_scheduler
+
+# Local dev / docker compose: a plain local Redis, one DB per use.
+REDIS_URL=redis://localhost:6379/0
+CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_RESULT_BACKEND=redis://localhost:6379/1
+
+# Production (Render, etc.): point all three at the same Upstash Redis
+# database instead -- Upstash is TLS-only (rediss://) and only gives you
+# database 0 (no /1, /2 selectors), which is fine here since the cache
+# keys ("carbon_intensity:*"), Celery broker queue, and Celery result keys
+# ("celery-task-meta-*") don't collide. Get the connection string from the
+# Upstash console (Redis tab -> "Connect" -> the rediss:// URL, which
+# already embeds the password).
+# REDIS_URL=rediss://default:<password>@<endpoint>.upstash.io:6379
+# CELERY_BROKER_URL=rediss://default:<password>@<endpoint>.upstash.io:6379
+# CELERY_RESULT_BACKEND=rediss://default:<password>@<endpoint>.upstash.io:6379
+
+# ElectricityMaps (https://www.electricitymaps.com/) — get a key at
+# https://api-portal.electricitymaps.com/
+ELECTRICITYMAPS_API_KEY=
+ELECTRICITYMAPS_BASE_URL=https://api.electricitymap.org/v3
+# How long to cache carbon intensity lookups in Redis, in seconds
+CARBON_CACHE_TTL_SECONDS=900
+
+WATTTIME_USERNAME=
+WATTTIME_PASSWORD=
+PYEOF__ENV_EXAMPLE
+
 mkdir -p "$(dirname "README.md")"
 cat > README.md << 'PYEOF_README_MD'
 # Carbon-Aware Compute Scheduler
@@ -94,9 +130,10 @@ real Postgres rows too).
 
 ## Stack
 
-FastAPI · Celery · Redis (broker + result backend + carbon-intensity cache)
-· Postgres · SQLAlchemy · Streamlit + Plotly · Docker Compose · deployed on
-Railway.
+FastAPI · Celery · Redis (broker + result backend + carbon-intensity cache;
+[Upstash](https://upstash.com/) in production) · Postgres (Neon or Render
+Postgres in production) · SQLAlchemy · Streamlit + Plotly · Docker Compose ·
+deployed on [Render](https://render.com/) (`render.yaml`).
 
 ## Layout
 
@@ -193,6 +230,57 @@ pytest
 All 60+ tests run against an in-memory SQLite DB and mocked HTTP/Celery
 calls — no Postgres, Redis, or ElectricityMaps key required.
 
+## Deploying to Render
+
+`render.yaml` (a [Render Blueprint](https://render.com/docs/blueprint-spec))
+defines the two long-running processes:
+
+- `carbon-scheduler-api` — a web service running the FastAPI app
+- `carbon-scheduler-worker` — a background worker running the Celery worker
+
+Both share the same env vars and need external, managed Postgres and Redis
+(Render's free tier doesn't include a persistent Redis instance, so this
+project uses [Upstash Redis](https://upstash.com/) instead — see below).
+
+1. Push this repo to GitHub, then in the Render dashboard: **New +** ->
+   **Blueprint**, point it at the repo. It reads `render.yaml` and creates
+   both services.
+2. Set `DATABASE_URL` on each service (Render only lets you fill in
+   `sync: false` vars per-service, not once): a
+   [Neon](https://neon.tech/) or [Render Postgres](https://render.com/docs/postgresql)
+   connection string. Either works — this project only needs a plain
+   `DATABASE_URL`, not a Render-managed database resource, so Neon's free
+   tier is a fine default.
+3. Set `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` on
+   each service to the **same** Upstash Redis `rediss://` connection
+   string (see the Upstash block in `.env.example`, and the Redis section
+   below for why one URL covers all three).
+4. Set `ELECTRICITYMAPS_API_KEY` on each service if you want live
+   scheduling to work in production (see Limitations).
+
+Tables are created automatically on first boot either process does (same
+`init_db()` as Docker Compose), so there's no separate migration step.
+
+The Streamlit dashboard isn't part of `render.yaml` — it's meant to be run
+locally against a copy of production data, or added as its own Render web
+service (`streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0`)
+the same way as the API, if you want it hosted too.
+
+## Redis: Upstash in production, plain Redis locally
+
+`REDIS_URL` (the ElectricityMaps cache), `CELERY_BROKER_URL`, and
+`CELERY_RESULT_BACKEND` are three separate settings but don't have to point
+at three separate databases. Locally / in Docker Compose they're the same
+container on different logical DBs (`/0`, `/1`); in production they're
+[Upstash Redis](https://upstash.com/), which only offers DB 0, so all three
+point at the identical `rediss://` URL — safe, because the three use
+non-overlapping key prefixes (`carbon_intensity:*`, Celery's queue keys,
+and `celery-task-meta-*`). `app/celery_app.py` detects the `rediss://`
+scheme and sets the `ssl_cert_reqs` option Celery/Kombu requires for it
+(without this, Celery refuses to start against a TLS Redis URL); the
+carbon-intensity client's `redis.asyncio.from_url()` already defaults to
+TLS-verified for `rediss://` and needed no change.
+
 ## Limitations
 
 - **No database migrations.** Tables are created with
@@ -220,6 +308,9 @@ PYEOF_README_MD
 
 mkdir -p "$(dirname "app/celery_app.py")"
 cat > app/celery_app.py << 'PYEOF_APP_CELERY_APP_PY'
+import ssl
+from urllib.parse import urlparse
+
 from celery import Celery
 from celery.signals import worker_process_init
 
@@ -234,7 +325,26 @@ celery_app = Celery(
     include=["app.tasks"],
 )
 
-celery_app.conf.update(task_serializer="json", result_serializer="json", accept_content=["json"])
+
+def _ssl_options(redis_url: str) -> dict | None:
+    """SSL options for a `rediss://` URL (e.g. Upstash Redis), else None.
+
+    Kombu/redis-py require ssl_cert_reqs to be set explicitly for a
+    rediss:// connection -- without it, Celery raises
+    "A rediss:// URL must have parameter ssl_cert_reqs" at startup.
+    """
+    if urlparse(redis_url).scheme != "rediss":
+        return None
+    return {"ssl_cert_reqs": ssl.CERT_REQUIRED}
+
+
+celery_app.conf.update(
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    broker_use_ssl=_ssl_options(settings.celery_broker_url),
+    redis_backend_use_ssl=_ssl_options(settings.celery_result_backend),
+)
 
 
 @worker_process_init.connect
@@ -252,191 +362,112 @@ def _create_tables(**kwargs) -> None:
     init_db()
 PYEOF_APP_CELERY_APP_PY
 
-mkdir -p "$(dirname "app/core/db.py")"
-cat > app/core/db.py << 'PYEOF_APP_CORE_DB_PY'
-from collections.abc import Generator
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-
-from app.core.config import get_settings
-
-settings = get_settings()
-
-engine = create_engine(settings.database_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def init_db() -> None:
-    """Create any tables that don't exist yet.
-
-    No Alembic migrations are set up for this project -- this is the
-    portfolio-project equivalent (idempotent, safe to call from both the
-    API and the Celery worker on every startup). Models must already be
-    imported (so they're registered on Base.metadata) before this runs.
-    """
-    Base.metadata.create_all(bind=engine)
-PYEOF_APP_CORE_DB_PY
-
-mkdir -p "$(dirname "app/main.py")"
-cat > app/main.py << 'PYEOF_APP_MAIN_PY'
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI
-
-from app.api import health, jobs, scheduling
-from app.core.db import init_db
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    # app.api.jobs / app.api.scheduling (imported below) already import
-    # app.models.job, so Job is registered on Base.metadata by the time
-    # this runs. No Alembic migrations are set up -- see init_db().
-    init_db()
-    yield
-
-
-app = FastAPI(title="Carbon-Aware Compute Scheduler", version="0.1.0", lifespan=lifespan)
-
-app.include_router(health.router)
-app.include_router(jobs.router)
-app.include_router(scheduling.router)
-
-
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"service": "carbon-aware-compute-scheduler"}
-PYEOF_APP_MAIN_PY
-
-mkdir -p "$(dirname "docker-compose.yml")"
-cat > docker-compose.yml << 'PYEOF_DOCKER-COMPOSE_YML'
+mkdir -p "$(dirname "render.yaml")"
+cat > render.yaml << 'PYEOF_RENDER_YAML'
 services:
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    env_file: .env
-    environment:
-      # Inside the compose network, services reach each other by service
-      # name, not localhost -- these override whatever .env has (.env is
-      # meant for running the API/worker/dashboard directly on the host).
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/carbon_scheduler
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+  - type: web
+    name: carbon-scheduler-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      # Neon or Render Postgres -- paste either provider's connection
+      # string here (Render Postgres: the "External Database URL" from its
+      # dashboard; Neon: the connection string from its dashboard, keep
+      # "?sslmode=require" if Neon includes it).
+      - key: DATABASE_URL
+        sync: false
+      # Upstash Redis (rediss://...) -- same URL as the worker's below.
+      - key: REDIS_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        sync: false
+      - key: CELERY_RESULT_BACKEND
+        sync: false
+      - key: ELECTRICITYMAPS_API_KEY
+        sync: false
+      - key: ELECTRICITYMAPS_BASE_URL
+        value: https://api.electricitymap.org/v3
+      - key: CARBON_CACHE_TTL_SECONDS
+        value: "900"
+      - key: WATTTIME_USERNAME
+        sync: false
+      - key: WATTTIME_PASSWORD
+        sync: false
 
-  worker:
-    build: .
-    command: celery -A app.celery_app.celery_app worker --loglevel=info
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/carbon_scheduler
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+  - type: worker
+    name: carbon-scheduler-worker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A app.celery_app.celery_app worker --loglevel=info
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        sync: false
+      - key: CELERY_RESULT_BACKEND
+        sync: false
+      - key: ELECTRICITYMAPS_API_KEY
+        sync: false
+      - key: ELECTRICITYMAPS_BASE_URL
+        value: https://api.electricitymap.org/v3
+      - key: CARBON_CACHE_TTL_SECONDS
+        value: "900"
+      - key: WATTTIME_USERNAME
+        sync: false
+      - key: WATTTIME_PASSWORD
+        sync: false
+PYEOF_RENDER_YAML
 
-  dashboard:
-    build: .
-    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
-    ports:
-      - "8501:8501"
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/carbon_scheduler
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      db:
-        condition: service_healthy
+mkdir -p "$(dirname "tests/test_celery_app.py")"
+cat > tests/test_celery_app.py << 'PYEOF_TESTS_TEST_CELERY_APP_PY'
+import ssl
 
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: carbon_scheduler
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+from app.celery_app import _ssl_options
 
-  redis:
-    image: redis:7
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
-volumes:
-  pgdata:
-PYEOF_DOCKER-COMPOSE_YML
+def test_ssl_options_none_for_plain_redis():
+    assert _ssl_options("redis://localhost:6379/0") is None
 
-mkdir -p "$(dirname ".dockerignore")"
-cat > .dockerignore << 'PYEOF__DOCKERIGNORE'
-.git
-.gitignore
-__pycache__/
-*.pyc
-.pytest_cache/
-.venv/
-venv/
-.env
-tests/
-README.md
-PYEOF__DOCKERIGNORE
 
-rm -f app/services/scheduler.py
+def test_ssl_options_set_for_rediss_url():
+    # Upstash (and most managed Redis providers) require TLS -- without
+    # ssl_cert_reqs set explicitly, Celery/Kombu refuses a rediss:// URL
+    # at startup with "A rediss:// URL must have parameter ssl_cert_reqs".
+    opts = _ssl_options("rediss://default:pw@example.upstash.io:6379")
+    assert opts == {"ssl_cert_reqs": ssl.CERT_REQUIRED}
+PYEOF_TESTS_TEST_CELERY_APP_PY
 
 git add -A
-git commit -m "Fix Docker Compose wiring (missing tables, wrong hostnames), remove dead scheduler stub, rewrite README
+git commit -m "Use Upstash Redis in production, add Render deploy config
 
-- api/worker/dashboard containers pointed at DATABASE_URL/REDIS_URL=localhost
-  inside docker-compose.yml, which resolves to the container itself, not the
-  db/redis services -- override with service hostnames in compose instead
-- nothing ever created the jobs table (no Alembic setup, no create_all call);
-  add app.core.db.init_db(), called from FastAPI's lifespan hook and from a
-  Celery worker_process_init signal so either process can create it first
-- add healthchecks + service_healthy depends_on for db/redis so api/worker
-  do not race Postgres/Redis startup
-- delete app/services/scheduler.py, an unused stub superseded by
-  job_scheduler.py + scoring.py
-- add .dockerignore
-- rewrite README: architecture/request-flow diagram, Docker Compose and
-  local setup instructions, documented limitations
+- app/celery_app.py: detect rediss:// broker/backend URLs and set the
+  ssl_cert_reqs option Celery/Kombu requires for TLS Redis (Upstash) --
+  without it, Celery refuses to start against a rediss:// URL at all
+- carbon_intensity.py's redis.asyncio client needed no change: it already
+  defaults to TLS-verified for rediss:// via redis-py
+- .env.example: document pointing REDIS_URL/CELERY_BROKER_URL/
+  CELERY_RESULT_BACKEND at the same Upstash rediss:// URL in production
+  (Upstash only has DB 0; the three uses don't share key prefixes)
+- add render.yaml: a Render Blueprint with the FastAPI web service and the
+  Celery background worker, both taking DATABASE_URL (Neon or Render
+  Postgres) and the Upstash Redis vars as per-service secrets
+- README: Deploying to Render + Redis/Upstash sections
+- tests/test_celery_app.py: unit tests for the new SSL-detection helper
+- remove push_docker_fix.sh, accidentally committed by the last script
 
-Verified: full pytest suite (60 passed) plus a live end-to-end run against
-real Postgres + Redis + Celery."
+Verified: full pytest suite (62 passed), plus booting the actual Celery
+worker against a fake rediss:// URL end-to-end (gets past SSL config to a
+real connection attempt, rather than failing at startup)."
 git push
 
 echo "Done."

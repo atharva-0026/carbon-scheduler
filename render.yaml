@@ -1,0 +1,62 @@
+services:
+  - type: web
+    name: carbon-scheduler-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      # Neon or Render Postgres -- paste either provider's connection
+      # string here (Render Postgres: the "External Database URL" from its
+      # dashboard; Neon: the connection string from its dashboard, keep
+      # "?sslmode=require" if Neon includes it).
+      - key: DATABASE_URL
+        sync: false
+      # Upstash Redis (rediss://...) -- same URL as the worker's below.
+      - key: REDIS_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        sync: false
+      - key: CELERY_RESULT_BACKEND
+        sync: false
+      - key: ELECTRICITYMAPS_API_KEY
+        sync: false
+      - key: ELECTRICITYMAPS_BASE_URL
+        value: https://api.electricitymap.org/v3
+      - key: CARBON_CACHE_TTL_SECONDS
+        value: "900"
+      - key: WATTTIME_USERNAME
+        sync: false
+      - key: WATTTIME_PASSWORD
+        sync: false
+
+  - type: worker
+    name: carbon-scheduler-worker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A app.celery_app.celery_app worker --loglevel=info
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        sync: false
+      - key: CELERY_RESULT_BACKEND
+        sync: false
+      - key: ELECTRICITYMAPS_API_KEY
+        sync: false
+      - key: ELECTRICITYMAPS_BASE_URL
+        value: https://api.electricitymap.org/v3
+      - key: CARBON_CACHE_TTL_SECONDS
+        value: "900"
+      - key: WATTTIME_USERNAME
+        sync: false
+      - key: WATTTIME_PASSWORD
+        sync: false
