@@ -21,3 +21,14 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def init_db() -> None:
+    """Create any tables that don't exist yet.
+
+    No Alembic migrations are set up for this project -- this is the
+    portfolio-project equivalent (idempotent, safe to call from both the
+    API and the Celery worker on every startup). Models must already be
+    imported (so they're registered on Base.metadata) before this runs.
+    """
+    Base.metadata.create_all(bind=engine)
