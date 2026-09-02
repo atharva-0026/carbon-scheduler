@@ -1,24 +1,35 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.db import get_db
 from app.core.regions import available_regions
 from app.models.job import Job
 from app.schemas.job import JobSubmitRequest, JobSubmitResponse
+from app.services.inprocess_worker import run_job_pipeline_sync
 from app.tasks import schedule_job
 
 router = APIRouter(tags=["scheduling"])
 
 
 @router.post("/submit-job", response_model=JobSubmitResponse)
-def submit_job(payload: JobSubmitRequest, db: Session = Depends(get_db)) -> JobSubmitResponse:
+def submit_job(
+    payload: JobSubmitRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> JobSubmitResponse:
     """Accept a deferrable job and hand it to the scheduler.
 
-    Persists the job as "pending", enqueues the `schedule_job` Celery task
-    (which picks a region/time slot via the scoring engine and dispatches
-    it), and returns the created job plus the Celery task id.
+    Persists the job as "pending", then either enqueues the `schedule_job`
+    Celery task (picks a region/time slot via the scoring engine and
+    dispatches it -- the normal path, when a Celery worker is running) or,
+    if `settings.use_inprocess_worker` is set (no worker available, e.g.
+    Render's free tier), runs the same decision + dispatch itself via
+    FastAPI `BackgroundTasks` after the response is sent. See
+    app/services/inprocess_worker.py for what that fallback doesn't do
+    (no delayed/countdown dispatch).
     """
     if payload.allowed_regions:
         unknown = [r for r in payload.allowed_regions if r not in available_regions()]
@@ -36,7 +47,11 @@ def submit_job(payload: JobSubmitRequest, db: Session = Depends(get_db)) -> JobS
     db.commit()
     db.refresh(job)
 
-    async_result = schedule_job.delay(job.id)
+    if get_settings().use_inprocess_worker:
+        background_tasks.add_task(run_job_pipeline_sync, job.id)
+        task_id = f"inprocess-{job.id}"
+    else:
+        task_id = schedule_job.delay(job.id).id
 
     return JobSubmitResponse(
         **{
@@ -50,5 +65,5 @@ def submit_job(payload: JobSubmitRequest, db: Session = Depends(get_db)) -> JobS
             "scheduled_start": job.scheduled_start,
             "created_at": job.created_at,
         },
-        task_id=async_result.id,
+        task_id=task_id,
     )

@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 import app.api.scheduling as scheduling_module
+from app.core.config import get_settings
 from app.core.db import get_db
 from app.main import app
 
@@ -65,6 +66,42 @@ def test_submit_job_defaults_name_to_job_type(monkeypatch, test_db):
         assert response.json()["name"] == "ci-run"
     finally:
         app.dependency_overrides.clear()
+
+
+def test_submit_job_uses_inprocess_worker_when_configured(monkeypatch, test_db):
+    # Simulates a deployment with no Celery worker (e.g. Render's free
+    # tier): USE_INPROCESS_WORKER=true should run the pipeline via
+    # BackgroundTasks instead of enqueuing a Celery task.
+    monkeypatch.setenv("USE_INPROCESS_WORKER", "true")
+    get_settings.cache_clear()
+
+    app.dependency_overrides[get_db] = _override_get_db(test_db)
+
+    calls = {}
+    monkeypatch.setattr(
+        scheduling_module, "run_job_pipeline_sync", lambda job_id: calls.setdefault("job_id", job_id)
+    )
+    # Should NOT be reached in this mode -- fail loudly if it is.
+    monkeypatch.setattr(
+        scheduling_module.schedule_job,
+        "delay",
+        lambda job_id: (_ for _ in ()).throw(AssertionError("Celery path used instead of in-process")),
+    )
+
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/submit-job",
+            json={"job_type": "batch", "estimated_duration_minutes": 10},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["task_id"] == f"inprocess-{body['id']}"
+        assert calls["job_id"] == body["id"]
+    finally:
+        app.dependency_overrides.clear()
+        get_settings.cache_clear()
 
 
 def test_submit_job_rejects_unknown_region(test_db):

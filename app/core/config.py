@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     watttime_username: str | None = None
     watttime_password: str | None = None
 
+    # True on deployments with no Celery worker (e.g. Render's free tier,
+    # which doesn't support background worker services): /submit-job runs
+    # the scheduling+dispatch pipeline in-process via FastAPI BackgroundTasks
+    # instead of enqueuing a Celery task. See app/services/inprocess_worker.py
+    # and the README's "Production architecture vs. free-tier demo" section.
+    use_inprocess_worker: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -11,13 +11,26 @@ services:
         value: 3.11.9
       - key: APP_ENV
         value: production
+      # Render's free tier only runs web services -- no `type: worker`
+      # background process, so there's no Celery worker to consume the
+      # queue /submit-job normally enqueues to. This makes the API run
+      # the scheduling+dispatch pipeline in-process instead (see
+      # app/services/inprocess_worker.py and the README). On a paid plan
+      # with a real worker service, set this back to "false" (or unset
+      # it -- false is the default).
+      - key: USE_INPROCESS_WORKER
+        value: "true"
       # Neon or Render Postgres -- paste either provider's connection
       # string here (Render Postgres: the "External Database URL" from its
       # dashboard; Neon: the connection string from its dashboard, keep
       # "?sslmode=require" if Neon includes it).
       - key: DATABASE_URL
         sync: false
-      # Upstash Redis (rediss://...) -- same URL as the worker's below.
+      # Upstash Redis (rediss://...) -- still used for the ElectricityMaps
+      # cache even in in-process mode. CELERY_BROKER_URL/RESULT_BACKEND
+      # aren't read anywhere while USE_INPROCESS_WORKER=true, but are left
+      # here so flipping back to a real Celery worker (see README) is a
+      # one-line change, not a re-add of every var.
       - key: REDIS_URL
         sync: false
       - key: CELERY_BROKER_URL
@@ -35,32 +48,18 @@ services:
       - key: WATTTIME_PASSWORD
         sync: false
 
-  - type: worker
-    name: carbon-scheduler-worker
-    runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: celery -A app.celery_app.celery_app worker --loglevel=info
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: APP_ENV
-        value: production
-      - key: DATABASE_URL
-        sync: false
-      - key: REDIS_URL
-        sync: false
-      - key: CELERY_BROKER_URL
-        sync: false
-      - key: CELERY_RESULT_BACKEND
-        sync: false
-      - key: ELECTRICITYMAPS_API_KEY
-        sync: false
-      - key: ELECTRICITYMAPS_BASE_URL
-        value: https://api.electricitymap.org/v3
-      - key: CARBON_CACHE_TTL_SECONDS
-        value: "900"
-      - key: WATTTIME_USERNAME
-        sync: false
-      - key: WATTTIME_PASSWORD
-        sync: false
+# No worker service: Render's free tier doesn't support `type: worker`
+# background services (that needs a paid plan). If you upgrade, add one
+# back here --
+#
+#   - type: worker
+#     name: carbon-scheduler-worker
+#     runtime: python
+#     plan: starter  # or another paid plan; free doesn't support workers
+#     buildCommand: pip install -r requirements.txt
+#     startCommand: celery -A app.celery_app.celery_app worker --loglevel=info
+#     envVars: [same keys as carbon-scheduler-api above, minus USE_INPROCESS_WORKER]
+#
+# and set USE_INPROCESS_WORKER to "false" (or remove it) on the web
+# service so /submit-job goes back to enqueuing Celery tasks instead of
+# running the pipeline in-process.

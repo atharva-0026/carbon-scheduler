@@ -187,40 +187,74 @@ pytest
 All 60+ tests run against an in-memory SQLite DB and mocked HTTP/Celery
 calls — no Postgres, Redis, or ElectricityMaps key required.
 
+## Production architecture vs. free-tier demo
+
+The architecture above — FastAPI enqueues, a separate Celery worker
+schedules and dispatches — is what this project actually runs everywhere
+that has a worker process: Docker Compose, or a paid Render plan. That's
+the design worth judging the project on: the API stays fast (it just
+writes a row and enqueues), scheduling work is retried/queued/scaled
+independently of request traffic, and a slot 3 hours from now is a real
+`apply_async(countdown=...)`, not something the request process has to
+sit around waiting for.
+
+Render's **free tier**, though, only runs web services — there's no
+`type: worker` background process available without upgrading. Rather than
+have the hosted demo silently do nothing when a job is submitted,
+`render.yaml`'s single web service sets `USE_INPROCESS_WORKER=true`, which
+makes `POST /submit-job` (`app/api/scheduling.py`) run the same scoring
+decision and the same stub dispatch itself — via FastAPI's `BackgroundTasks`,
+after the response is sent — instead of enqueuing a Celery task
+(`app/services/inprocess_worker.py`). No separate worker process, no Redis
+broker/backend involved in that path at all.
+
+This fallback is honestly worse in one specific way: it can't honor a
+delayed start time. Celery's `countdown` lets a separate process wake up
+later; a web request process has no equivalent without blocking a thread
+for however long the delay is, which isn't reasonable on a single
+free-tier instance. So on the hosted demo, jobs schedule then dispatch
+immediately, whatever region the scoring engine picked — real carbon-aware
+*region* selection, just not real deadline-aware *deferral*. Locally, in
+Docker Compose, or on a paid Render plan with a worker service, leave
+`USE_INPROCESS_WORKER` unset (default `false`) and you get the full
+Celery pipeline, countdown included.
+
 ## Deploying to Render
 
 `render.yaml` (a [Render Blueprint](https://render.com/docs/blueprint-spec))
-defines the two long-running processes:
-
-- `carbon-scheduler-api` — a web service running the FastAPI app
-- `carbon-scheduler-worker` — a background worker running the Celery worker
-
-Both share the same env vars and need external, managed Postgres and Redis
-(Render's free tier doesn't include a persistent Redis instance, so this
-project uses [Upstash Redis](https://upstash.com/) instead — see below).
+defines one service: `carbon-scheduler-api`, a free-tier web service
+running the FastAPI app with `USE_INPROCESS_WORKER=true` (see above — no
+worker service is defined, since the free tier can't run one).
 
 1. Push this repo to GitHub, then in the Render dashboard: **New +** ->
    **Blueprint**, point it at the repo. It reads `render.yaml` and creates
-   both services.
-2. Set `DATABASE_URL` on each service (Render only lets you fill in
-   `sync: false` vars per-service, not once): a
-   [Neon](https://neon.tech/) or [Render Postgres](https://render.com/docs/postgresql)
-   connection string. Either works — this project only needs a plain
-   `DATABASE_URL`, not a Render-managed database resource, so Neon's free
-   tier is a fine default.
-3. Set `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` on
-   each service to the **same** Upstash Redis `rediss://` connection
-   string (see the Upstash block in `.env.example`, and the Redis section
-   below for why one URL covers all three).
-4. Set `ELECTRICITYMAPS_API_KEY` on each service if you want live
-   scheduling to work in production (see Limitations).
+   the service.
+2. Set `DATABASE_URL` (Render only lets you fill in `sync: false` vars
+   per-service): a [Neon](https://neon.tech/) or
+   [Render Postgres](https://render.com/docs/postgresql) connection
+   string. Either works — this project only needs a plain `DATABASE_URL`,
+   not a Render-managed database resource, so Neon's free tier is a fine
+   default.
+3. Set `REDIS_URL` to an [Upstash Redis](https://upstash.com/) `rediss://`
+   connection string (see `.env.example`) — still used for the
+   ElectricityMaps cache even though Celery isn't in the picture here.
+   `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` can be left blank on the
+   free tier; they're unused while `USE_INPROCESS_WORKER=true`.
+4. Set `ELECTRICITYMAPS_API_KEY` if you want live scheduling to work in
+   production (see Limitations).
 
-Tables are created automatically on first boot either process does (same
-`init_db()` as Docker Compose), so there's no separate migration step.
+Tables are created automatically on first boot (same `init_db()` as
+Docker Compose), so there's no separate migration step.
 
-The Streamlit dashboard isn't part of `render.yaml` — it's meant to be run
-locally against a copy of production data, or added as its own Render web
-service (`streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0`)
+**On a paid Render plan**, `render.yaml` has a commented-out `worker`
+service block ready to uncomment — add it back, set
+`USE_INPROCESS_WORKER=false` (or remove it) on the web service, and fill
+in `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` with the same Upstash URL as
+`REDIS_URL`, to get the real Celery pipeline in production.
+
+The Streamlit dashboard isn't part of `render.yaml` either — it's meant to
+be run locally against a copy of production data, or added as its own
+Render web service (`streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0`)
 the same way as the API, if you want it hosted too.
 
 ## Redis: Upstash in production, plain Redis locally
@@ -261,3 +295,9 @@ TLS-verified for `rediss://` and needed no change.
 - **Cost figures are illustrative**, not real cloud pricing (see
   `app/core/carbon_math.py`) — flat made-up per-region hourly rates, used
   only for the dashboard's cost/carbon tradeoff chart.
+- **The free-tier demo doesn't honor delayed scheduling.** With
+  `USE_INPROCESS_WORKER=true` (only set on the hosted Render free-tier
+  deploy), `app/services/inprocess_worker.py` dispatches immediately after
+  scheduling instead of waiting for the chosen start time — see
+  "Production architecture vs. free-tier demo" above for why, and what
+  still works despite it (region selection) vs. what doesn't (deferral).
