@@ -111,6 +111,7 @@ deployed on [Render](https://render.com/) (`render.yaml`).
   (`dashboard/data.py`)
 - `scripts/seed_data.py` — generates demo job history (Postgres and/or the
   dashboard's CSV fallback)
+- `migrations/` — Alembic migrations (see "Database migrations" below)
 - `tests/` — pytest (unit tests only; hermetic SQLite in-memory DB, no
   external services needed to run them)
 
@@ -186,6 +187,29 @@ pytest
 
 All 60+ tests run against an in-memory SQLite DB and mocked HTTP/Celery
 calls — no Postgres, Redis, or ElectricityMaps key required.
+
+## Database migrations
+
+```bash
+alembic upgrade head
+```
+
+`migrations/` (Alembic, already in `requirements.txt`) reads the same
+`DATABASE_URL` the app itself connects with (`migrations/env.py` pulls it
+from `app.core.config.Settings`), so no separate connection string to
+keep in sync. The one migration so far (`migrations/versions/`) creates
+the `jobs` table and is kept honest by `tests/test_migrations.py`, which
+fails if the migrated schema and the `Job` ORM model ever drift apart.
+
+This is additive, not a replacement for `init_db()`'s
+`Base.metadata.create_all()` (`app/core/db.py`, called on every API/worker
+startup) — that stays as the zero-step way to get a fresh demo database
+running (Docker Compose, the Render free-tier deploy) without a manual
+migration step first. Run `alembic upgrade head` when you want schema
+changes tracked going forward instead of just appearing via
+`create_all()`; on a database `create_all()` already set up, run
+`alembic stamp head` first so Alembic knows the `jobs` table already
+exists rather than trying to create it again.
 
 ## Production architecture vs. free-tier demo
 
@@ -274,14 +298,14 @@ TLS-verified for `rediss://` and needed no change.
 
 ## Limitations
 
-- **No database migrations.** Tables are created with
-  `Base.metadata.create_all()` on startup (`app/core/db.py::init_db`,
-  called from the FastAPI lifespan hook and from a Celery
-  `worker_process_init` signal, so either process can be first to boot).
-  It's idempotent and fine for a portfolio project's single `Job` table, but
-  it won't handle schema changes to existing columns — a real project would
-  use the Alembic setup that's already in `requirements.txt` but not yet
-  wired up.
+- **`init_db()` still bootstraps fresh databases via `create_all()`,
+  not a migration.** `app/core/db.py::init_db` (called from the FastAPI
+  lifespan hook and from a Celery `worker_process_init` signal, so either
+  process can be first to boot) is what gets a brand new Docker Compose or
+  Render free-tier database to `jobs` existing at all, with zero manual
+  step. Real schema changes from here on should go through Alembic (see
+  "Database migrations" above) instead of editing the `Job` model and
+  relying on `create_all()` to catch up — it won't alter existing columns.
 - **No synthetic fallback for live scheduling.** If
   `ELECTRICITYMAPS_API_KEY` isn't set (or the API call fails for every
   allowed region), `schedule_job` marks the job `failed` rather than
